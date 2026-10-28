@@ -77,7 +77,8 @@ class LinuxContainerEngine @Inject constructor(
     private val containerInstaller: ContainerInstaller,
     private val containerOsDetector: ContainerOsDetector,
     private val containerSettingsRepository: com.aicode.feature.settings.data.repository.ContainerSettingsRepository,
-    private val pathHomeResolver: com.aicode.feature.workspace.domain.PathHomeResolver
+    private val pathHomeResolver: com.aicode.feature.workspace.domain.PathHomeResolver,
+    private val hostRoot: com.aicode.core.root.HostRoot
 ) : CommandEngine {
     /** 容器初始化的实时进度，供所有入口（终端页/AI/后台终端/MCP）共享同一份状态。 */
     private val _initProgress = MutableStateFlow<ContainerInitState>(ContainerInitState.Idle)
@@ -165,7 +166,85 @@ class LinuxContainerEngine @Inject constructor(
          * provision-script-skipped），App 端仅读它判断是否完成。
          */
         private const val PROVISION_VERSION = "provision-script-v9"
+
+        /**
+         * 需要原样透传进容器的宿主机目录（proot `-b`，源=目标）。
+         * 仅限只读的系统运行时目录；**刻意不含 /data**——容器内 uid 仍是 app uid，绑 /data 既读不到
+         * 别的应用数据（DAC + SELinux 双重拦截），又会把宿主应用数据目录暴露成容器内可枚举路径。
+         * 需要真 root 的文件访问走 `root <cmd>`（[com.aicode.core.root.HostRoot]，宿主上下文执行）。
+         */
+        private val HOST_RUNTIME_BINDS = listOf(
+            "/apex",          // linker64 / ART 运行时所在分区（关键：缺它则宿主二进制全部 exec ENOENT）
+            "/linkerconfig",  // dynamic linker 命名空间配置
+            "/vendor",        // 厂商专有 HAL/库
+            "/product",       // 产品分区
+            "/sdcard",        // 共享存储（工作区常选中 sdcard 下的项目）
+        )
+
+        /**
+         * 宿主 root 命令前缀：`root <cmd>` 或 `sudo <cmd>`。
+         *
+         * 命中后命令**不进入 proot**，改由 [com.aicode.core.root.HostRoot] 在宿主上下文用
+         * `su -c` 执行（见该类注释：proot 内的 su 是假 root，路径会被翻译回 rootfs）。
+         */
+        private val ROOT_PREFIX = Regex("^\\s*(?:root|sudo)\\s+(?=\\S)")
+
+        /**
+         * root 模式（[com.aicode.core.root.RootModeStore]）下额外绑定的宿主目录。
+         * 这些目录是非 root 容器**读不到**的（DAC + SELinux），只有在容器进程真是 uid=0 时才有意义。
+         * 不含 /proc、/sys（已在基础 argv 绑）、也不含 /apex（[HOST_RUNTIME_BINDS] 已含）。
+         */
+        private val ROOT_EXTRA_BINDS = listOf(
+            "/data",      // 应用数据、/data/local/tmp —— 真 root 后核心需求
+            "/storage",   // 外置/TF 卡挂载点
+            "/mnt",       // 部分厂商把 /sdcard 软链到 /mnt
+            "/odm",       // 厂商 odm 分区
+            "/system_ext" // 系统扩展分区
+        )
     }
+
+    /** 命中 root 前缀则返回去掉前缀的真实命令，否则 null（走容器）。 */
+    private fun stripRootPrefix(command: String): String? =
+        if (ROOT_PREFIX.containsMatchIn(command)) command.replaceFirst(ROOT_PREFIX, "") else null
+
+    /** 宿主 root 不可用时的统一提示（让 AI 知道该去授权，而不是当成容器里的普通失败）。 */
+    private fun rootUnavailableHint(detail: String): String =
+        "宿主 root 不可用：$detail。请在 Magisk/KernelSU/APatch 中授予本应用超级用户权限后重试。"
+
+    /** 同步执行宿主 root 命令（含授权探测）。 */
+    private suspend fun execHostRoot(
+        command: String,
+        projectPath: String?,
+        timeoutMs: Long
+    ): com.aicode.core.root.HostRoot.Result = withContext(Dispatchers.IO) {
+        val state = if (hostRoot.isGrantedCached()) hostRoot.stateCached() else hostRoot.probe()
+        if (!state.granted) {
+            return@withContext com.aicode.core.root.HostRoot.Result(rootUnavailableHint(state.detail), 1, false)
+        }
+        hostRoot.runSync(command, projectPath, timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS))
+    }
+
+    /** 流式执行宿主 root 命令（含授权探测；探测会触发 Magisk 授权弹窗）。 */
+    private fun streamHostRoot(
+        command: String,
+        projectPath: String?,
+        timeoutMs: Long
+    ): Flow<CommandEvent> = flow {
+        val state = if (hostRoot.isGrantedCached()) hostRoot.stateCached() else hostRoot.probe()
+        if (!state.granted) {
+            emit(CommandEvent.Line(rootUnavailableHint(state.detail)))
+            emit(CommandEvent.Exit(1))
+            return@flow
+        }
+        val effective = timeoutMs.coerceIn(1L, MAX_TIMEOUT_MS)
+        FileLogger.d(TAG, "执行命令(宿主 root) cwd=$projectPath timeout=${effective}ms: ${sanitizeCommandForLog(command)}")
+        hostRoot.runStream(command, projectPath, effective).collect { event ->
+            when (event) {
+                is com.aicode.core.root.HostRoot.HostLine.Line -> emit(CommandEvent.Line(event.text))
+                is com.aicode.core.root.HostRoot.HostLine.Exit -> emit(CommandEvent.Exit(event.code))
+            }
+        }
+    }.flowOn(Dispatchers.IO)
 
     /** 标记基础包已按 [PROVISION_VERSION] 配置完成（内容为版本号，或用户手动安装的跳过标记），按当前 profile 的 rootfs 目录存放（内置/自定义各自独立）。 */
     private fun provisionMarker(profile: ContainerProfile): java.io.File =
@@ -187,6 +266,11 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): Flow<CommandEvent> = flow {
+        // root 前缀优先于容器就绪检查：root 命令在宿主执行，不依赖 rootfs。
+        stripRootPrefix(command)?.let {
+            emitAll(streamHostRoot(it, projectPath, timeoutMs))
+            return@flow
+        }
         // 未就绪（rootfs 未解压或基础包未配置）时不自动初始化，直接提示用户去终端页完成初始化。
         notReadyHint()?.let {
             emit(CommandEvent.Line(it))
@@ -283,6 +367,8 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): String = withContext(Dispatchers.IO) {
+        // root 前缀走宿主 su，不经 proot（容器内 exec su 拿到的仍是假 root）。
+        stripRootPrefix(command)?.let { return@withContext execHostRoot(it, projectPath, timeoutMs).output }
         // 未就绪时不自动初始化，直接返回引导文案，由用户去终端页完成初始化。
         notReadyHint()?.let { return@withContext it }
         execCaptured(command, projectPath, timeoutMs).output
@@ -297,6 +383,10 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): CommandResult = withContext(Dispatchers.IO) {
+        stripRootPrefix(command)?.let {
+            val r = execHostRoot(it, projectPath, timeoutMs)
+            return@withContext CommandResult(r.output, r.exitCode, r.truncated)
+        }
         // 未就绪时不自动初始化，直接返回引导文案，由用户去终端页完成初始化。
         notReadyHint()?.let { return@withContext CommandResult(it, null) }
         val r = execCaptured(command, projectPath, timeoutMs)
@@ -327,6 +417,10 @@ class LinuxContainerEngine @Inject constructor(
         projectPath: String?,
         timeoutMs: Long
     ): CommandResult = withContext(Dispatchers.IO) {
+        stripRootPrefix(command)?.let {
+            val r = execHostRoot(it, projectPath, timeoutMs)
+            return@withContext CommandResult(r.output, r.exitCode, r.truncated)
+        }
         notReadyHint()?.let { return@withContext CommandResult(it, null) }
         val r = execCaptured(command, projectPath, timeoutMs, unbounded = true)
         CommandResult(r.output, r.exitCode, r.truncated)
@@ -698,7 +792,8 @@ class LinuxContainerEngine @Inject constructor(
         argv.add("exec \"\$0\" \"\$@\"")
         argv.add(program)
         argv.addAll(programArgs)
-        return ProotInvocation(argv, buildContainerEnv(profile) + profile.env + extraEnv)
+        val env = buildContainerEnv(profile) + profile.env + extraEnv
+        return ProotInvocation(wrapWithHostRootIfNeeded(argv, env), env)
     }
 
     /**
@@ -711,8 +806,46 @@ class LinuxContainerEngine @Inject constructor(
         argv.add(defaultShell())
         argv.add("-c")
         argv.add(command)
-        return ProotInvocation(argv, buildContainerEnv(currentProfile) + currentProfile.env)
+        val env = buildContainerEnv(currentProfile) + currentProfile.env
+        return ProotInvocation(wrapWithHostRootIfNeeded(argv, env), env)
     }
+
+    /**
+     * root 模式包装：把整条 proot argv 拼成一个 shell 脚本，外层套 `su -c "..."`。
+     *
+     * 关键点：proot **进程本身**必须是 uid=0。否则 tracee 只是 `proot -0` 的 ptrace 伪装，
+     * 内核 cred 仍是 app uid，容器内读 /data 等会 EACCES。用 su 拉起 proot 后，proot 及其
+     * 所有子进程（终端 PTY、AI 命令、git）都继承宿主 uid=0，这时才是真 root。
+     *
+     * 环境变量显式 `export` 注入：su 服务端可能重置环境，而 proot 依赖 LD_LIBRARY_PATH /
+     * PROOT_LOADER 等变量，丢失后直接起不来。
+     *
+     * 措辞保留：无 su（未装 Magisk/KernelSU）时降级为原 argv（伪 root），不阻止容器启动。
+     */
+    private fun wrapWithHostRootIfNeeded(
+        argv: List<String>,
+        env: Map<String, String>
+    ): MutableList<String> {
+        val wrapped = argv.toMutableList()
+        if (!com.aicode.core.root.RootModeStore.isEnabled(context)) return wrapped
+        val su = hostRoot.suBinary()
+        if (su == null) {
+            FileLogger.w(TAG, "root 模式已开启但系统无 su，降级为 proot 伪 root")
+            return wrapped
+        }
+        val exports = env.entries.joinToString(" ") { "${it.key}=${shellQuoteForSu(it.value)}" }
+        val script = buildString {
+            if (exports.isNotEmpty()) {
+                append("export ").append(exports).append("; ")
+            }
+            append("exec ").append(argv.joinToString(" ") { shellQuoteForSu(it) })
+        }
+        FileLogger.i(TAG, "root 模式：容器由 $su 启动（proot 及其子进程均为宿主 uid=0）")
+        return mutableListOf(su, "-c", script)
+    }
+
+    /** POSIX 单引号转义（内嵌单引号用 '\\'' 闭合）。 */
+    private fun shellQuoteForSu(raw: String): String = "'" + raw.replace("'", "'\\''") + "'"
 
     /**
      * 构造 PRoot 调用的公共前缀 argv：proot 二进制 + rootfs + 标准绑定 + 伪 root + 工作区绑定，
@@ -735,6 +868,31 @@ class LinuxContainerEngine @Inject constructor(
             "-b", "/system",  // 绑定 /system 让宿主动态库可用
             "-0"              // 伪 root，apk 等需要
         )
+
+        // 宿主 Android 运行时目录。Android 10+ 起 /system/bin/* 这类 PIE 可执行文件的 ELF
+        // interpreter 是 /apex/com.android.runtime/bin/linker64（/system/bin/linker64 只是它的
+        // symlink）。只绑 /system 而不绑 /apex 时，该 symlink 在容器内悬空，内核打开 interpreter
+        // 返回 ENOENT —— 表现为 exec 任何宿主二进制都报
+        // "cannot execute: required file not found"（getprop / toybox / pm / su 全中）。
+        // 绑上后这些工具在容器内可直接调用（免 root 的 pm/am/dumpsys/getprop 一次到位）。
+        // /vendor、/product 供部分厂商 ROM 的二进制与其依赖库解析；/linkerconfig 供 linker 命名空间。
+        for (hostDir in HOST_RUNTIME_BINDS) {
+            if (java.io.File(hostDir).exists()) {
+                argv.add("-b")
+                argv.add(hostDir)
+            }
+        }
+
+        // 全局 root 模式：容器内进程已是真 uid=0，此时绑定宿主数据目录才能真读写
+        // （非 root 模式下绑 /data 无意义：内核 cred 仍是 app uid，读了也是 EACCES）。
+        if (com.aicode.core.root.RootModeStore.isEnabled(context)) {
+            for (hostDir in ROOT_EXTRA_BINDS) {
+                if (java.io.File(hostDir).exists()) {
+                    argv.add("-b")
+                    argv.add(hostDir)
+                }
+            }
+        }
 
         // 把当前工作区目录绑定到容器内 ~/workspace（即 /root/workspace），使命令与文件工具作用于同一目录
         if (projectPath != null) {

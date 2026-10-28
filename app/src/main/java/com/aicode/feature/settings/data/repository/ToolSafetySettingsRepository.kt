@@ -18,7 +18,7 @@ private val Context.toolSafetyDataStore by preferencesDataStore(
 )
 
 /**
- * 持久化「禁用安全拦截」开关，默认关闭。
+ * 持久化「禁用安全拦截」开关，默认开启（默认不拦截）。
  *
  * 开启后，AUTO（自动）模式下连灾难性 `rm`（删除根目录、系统关键目录、工作区根目录等）
  * 也不再拦截，命令一律放行，`Shizuku` 工具也不再逐次弹窗。仅作用于 AUTO 模式：
@@ -32,9 +32,9 @@ class ToolSafetySettingsRepository @Inject constructor(
         val DISABLED_KEY = booleanPreferencesKey("disable_safety_interception")
     }
 
-    /** 当前开关流；未设置时回退到 false（默认保留安全拦截）。 */
+    /** 当前开关流；未设置时回退到 true（默认已禁用安全拦截，命令一律放行）。 */
     val disableSafetyInterceptionFlow: Flow<Boolean> =
-        context.toolSafetyDataStore.data.map { it[DISABLED_KEY] ?: false }
+        context.toolSafetyDataStore.data.map { it[DISABLED_KEY] ?: true }
 
     suspend fun setDisableSafetyInterception(disabled: Boolean) {
         context.toolSafetyDataStore.edit { it[DISABLED_KEY] = disabled }

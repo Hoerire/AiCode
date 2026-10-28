@@ -6,12 +6,10 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.aicode.core.net.AppProxy
-import com.aicode.core.util.ApkInstaller
 import com.aicode.core.util.FileLogger
 import com.aicode.core.util.LogLevel
 import com.aicode.feature.agent.data.local.dao.LlmCallRecordDao
 import com.aicode.feature.agent.data.local.dao.RecentCallRecord
-import com.aicode.feature.agent.data.local.entity.LlmCallRecordEntity
 import com.aicode.feature.agent.domain.container.ConnectionState
 import com.aicode.feature.agent.domain.container.ContainerImageCatalog
 import com.aicode.feature.agent.domain.container.ContainerImageEntry
@@ -53,15 +51,6 @@ import com.aicode.feature.settings.data.remote.ContainerImageDownloader
 import com.aicode.feature.settings.data.remote.ContainerImageVersionProbe
 import com.aicode.feature.settings.data.remote.ModelMetadataService
 import com.aicode.feature.settings.data.remote.ModelTestResult
-import com.aicode.feature.settings.data.remote.ApkDownloadResult
-import com.aicode.feature.settings.data.remote.ApkDownloader
-import com.aicode.feature.settings.data.remote.ApkVerifier
-import com.aicode.feature.settings.data.remote.ApkVerifyResult
-import com.aicode.feature.settings.data.remote.UpdateAsset
-import com.aicode.feature.settings.data.remote.UpdateCheckResult
-import com.aicode.feature.settings.data.remote.UpdateCheckService
-import com.aicode.feature.settings.data.repository.UpdateCheckSettingsRepository
-import com.aicode.feature.settings.data.repository.UpdateChannel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import com.aicode.feature.settings.data.repository.AppThemeMode
 import com.aicode.feature.settings.data.repository.ContainerSettingsRepository
@@ -96,7 +85,6 @@ import com.aicode.feature.settings.domain.model.AIProviderConfig
 import com.aicode.feature.settings.domain.model.DashboardContext
 import com.aicode.feature.settings.domain.model.ModelMetadata
 import com.aicode.feature.settings.domain.model.modelMetadataKey
-import com.aicode.feature.settings.domain.model.ProviderDashboardResult
 import com.aicode.feature.settings.domain.model.ProviderDashboardState
 import com.aicode.feature.settings.domain.service.ModelCostCalculator
 import com.aicode.feature.settings.domain.service.ProviderDashboardRunner
@@ -178,43 +166,6 @@ data class LogViewerUiState(
     val loading: Boolean = false,
     val error: String? = null
 )
-
-/** 检查更新弹窗状态（全局弹窗宿主在主页 AppNavigation 层渲染，自动/手动共用）。 */
-sealed interface UpdateCheckUiState {
-    data object Idle : UpdateCheckUiState
-    data object Checking : UpdateCheckUiState
-    data object UpToDate : UpdateCheckUiState
-
-    /** 检测到新版本。[asset] 为该版本可下载的更新包；Release 没挂 APK 时为 null（只能去浏览器下载）。 */
-    data class NewVersion(
-        val latestTag: String,
-        val changelog: String,
-        val asset: UpdateAsset? = null
-    ) : UpdateCheckUiState
-
-    /** 正在下载更新包（关闭弹窗不中断，重开可见进度）。 */
-    data class Downloading(
-        val latestTag: String,
-        val percent: Int,
-        val downloaded: Long,
-        val total: Long
-    ) : UpdateCheckUiState
-
-    /** 更新包已落盘并通过自检，等待拉起安装器。[needPermission] 为真表示还没授权安装未知应用。 */
-    data class ReadyToInstall(
-        val previous: NewVersion,
-        val apk: File,
-        val needPermission: Boolean
-    ) : UpdateCheckUiState
-
-    /** 下载或自检失败。[previous] 保留版本信息，供「重试」与「浏览器下载」继续使用。 */
-    data class DownloadFailed(
-        val previous: NewVersion,
-        val message: String
-    ) : UpdateCheckUiState
-
-    data class Error(val message: String) : UpdateCheckUiState
-}
 
 /** Token 统计周期：决定统计起始时间与趋势粒度（今天=小时粒度，其余=天粒度）。 */
 enum class TokenStatsPeriod(val labelRes: Int, val startMillis: (Long) -> Long) {
@@ -395,10 +346,6 @@ class SettingsViewModel @Inject constructor(
     private val remoteRepository: RemoteRepository,
     private val llmCallRecordDao: LlmCallRecordDao,
     private val modelCostCalculator: ModelCostCalculator,
-    private val updateCheckSettingsRepository: UpdateCheckSettingsRepository,
-    private val updateCheckService: UpdateCheckService,
-    private val apkDownloader: ApkDownloader,
-    private val apkVerifier: ApkVerifier,
     private val providerDashboardRunner: ProviderDashboardRunner,
     private val terminalSettingsRepository: TerminalSettingsRepository,
     private val proxySettingsRepository: ProxySettingsRepository
@@ -532,28 +479,6 @@ class SettingsViewModel @Inject constructor(
 
     private val _logViewerState = MutableStateFlow(LogViewerUiState())
     val logViewerState: StateFlow<LogViewerUiState> = _logViewerState.asStateFlow()
-
-    private val _updateCheckState = MutableStateFlow<UpdateCheckUiState>(UpdateCheckUiState.Idle)
-    val updateCheckState: StateFlow<UpdateCheckUiState> = _updateCheckState.asStateFlow()
-
-    /**
-     * 更新弹窗是否可见。与 [updateCheckState] 分开：下载中关掉弹窗只收起界面、不打断下载，
-     * 之后再点「版本」行即可按原状态重新亮出来（不必重下已完成的包）。
-     */
-    private val _updateCheckVisible = MutableStateFlow(false)
-    val updateCheckVisible: StateFlow<Boolean> = _updateCheckVisible.asStateFlow()
-
-    private val _updateCheckEnabled = MutableStateFlow(updateCheckSettingsRepository.autoCheckEnabled)
-    val updateCheckEnabled: StateFlow<Boolean> = _updateCheckEnabled.asStateFlow()
-
-    private val _updateCheckChannel = MutableStateFlow(updateCheckSettingsRepository.channel)
-    val updateCheckChannel: StateFlow<UpdateChannel> = _updateCheckChannel.asStateFlow()
-
-    private val _updateCheckMirror = MutableStateFlow(updateCheckSettingsRepository.downloadMirror)
-    val updateCheckMirror: StateFlow<String> = _updateCheckMirror.asStateFlow()
-
-    /** 更新包下载协程；重试前先顶掉上一个，避免两路并发写同一状态。 */
-    private var apkDownloadJob: Job? = null
 
     private val _keepaliveEnabled = MutableStateFlow(false)
     val keepaliveEnabled: StateFlow<Boolean> = _keepaliveEnabled.asStateFlow()
@@ -699,7 +624,7 @@ class SettingsViewModel @Inject constructor(
     val currentProjectName: StateFlow<String?> = permissionRulesRepository.currentProjectNameFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    private val _disableSafetyInterception = MutableStateFlow(false)
+    private val _disableSafetyInterception = MutableStateFlow(true)
     val disableSafetyInterception: StateFlow<Boolean> = _disableSafetyInterception.asStateFlow()
 
     private val _activeProfileId = MutableStateFlow(ContainerProfile.BUILTIN_ID)
@@ -1767,216 +1692,6 @@ class SettingsViewModel @Inject constructor(
     }
 
     // ── 检查更新 ──
-
-    /**
-     * 检查更新。手动模式（关于页点击）不受开关与每日限制；自动模式（主页启动）
-     * 需开关开启且当天未检测过，失败时静默（不弹错误窗），无论结果都记录当天已检。
-     */
-    fun checkUpdate(manual: Boolean) {
-        val current = _updateCheckState.value
-        // 下载中 / 安装包已就绪：不打断当前流程；手动点「版本」行只把弹窗重新亮出来，不重下
-        if (current is UpdateCheckUiState.Downloading || current is UpdateCheckUiState.ReadyToInstall) {
-            if (manual) _updateCheckVisible.value = true
-            return
-        }
-        // 已在检测中：手动点击同样只需把弹窗亮回来（用户可能刚把它关掉）
-        if (current == UpdateCheckUiState.Checking) {
-            if (manual) _updateCheckVisible.value = true
-            return
-        }
-        if (!manual) {
-            if (!updateCheckSettingsRepository.autoCheckEnabled) return
-            if (updateCheckSettingsRepository.hasCheckedToday()) return
-        }
-        viewModelScope.launch {
-            // 手动检查显示「检测中」反馈；自动检查全程无感，仅检测到新版本才弹窗
-            if (manual) {
-                _updateCheckVisible.value = true
-                _updateCheckState.value = UpdateCheckUiState.Checking
-            }
-            val result = updateCheckService.checkForUpdate(
-                currentVersion = currentVersionName(),
-                channel = updateCheckSettingsRepository.channel
-            )
-            _updateCheckState.value = when (result) {
-                is UpdateCheckResult.UpToDate -> {
-                    if (manual) UpdateCheckUiState.UpToDate else UpdateCheckUiState.Idle
-                }
-                is UpdateCheckResult.NewVersion -> {
-                    _updateCheckVisible.value = true
-                    UpdateCheckUiState.NewVersion(
-                        latestTag = result.info.latestTag,
-                        changelog = result.info.changelog,
-                        asset = result.info.latestAsset
-                    )
-                }
-                is UpdateCheckResult.Error -> {
-                    if (manual) UpdateCheckUiState.Error(result.message) else UpdateCheckUiState.Idle
-                }
-            }
-            // 无论结果如何，都刷新 ~/.aicode/update-info.json 供 AI 读取
-            updateCheckSettingsRepository.writeUpdateInfo(
-                currentVersion = currentVersionName(),
-                channel = updateCheckSettingsRepository.channel,
-                result = result
-            )
-            if (!manual) {
-                updateCheckSettingsRepository.markCheckedToday()
-            }
-        }
-    }
-
-    /**
-     * 应用内安装是否可用：只对正式包开放。beta/debug 变体的 applicationId 带后缀
-     * （`com.aicode.beta` / `com.aicode.debug`），装 GitHub 上的正式包等于「装上第二个 App」，
-     * 包名自检也会把它拦下——索性不给下载入口，省掉一次十几 MB 的白下载。
-     */
-    val inAppInstallSupported: Boolean
-        get() = context.packageName == RELEASE_APPLICATION_ID
-
-    /**
-     * 下载并安装（更新弹窗主按钮）。
-     *
-     * 按当前状态分派：已就绪 → 直接拉起安装器（用户可能刚授完权回来）；检测到新版本 → 下载；
-     * 下载失败 → 用保留的版本信息重试。下载走「镜像 → 直连」两跳，下完先做包名/签名/versionCode
-     * 自检，全过才交给系统安装器。
-     */
-    fun downloadAndInstall() {
-        if (!inAppInstallSupported) return
-        when (val current = _updateCheckState.value) {
-            is UpdateCheckUiState.ReadyToInstall -> startInstall(current)
-            is UpdateCheckUiState.NewVersion -> startDownload(current)
-            is UpdateCheckUiState.DownloadFailed -> startDownload(current.previous)
-            else -> Unit
-        }
-    }
-
-    private fun startDownload(target: UpdateCheckUiState.NewVersion) {
-        val asset = target.asset
-        if (asset == null) {
-            // Release 没挂 APK 资产（或资产命名不认识）：只能引导去浏览器下载
-            _updateCheckState.value = UpdateCheckUiState.DownloadFailed(
-                previous = target,
-                message = context.getString(R.string.about_update_verify_not_apk)
-            )
-            return
-        }
-        if (apkDownloadJob?.isActive == true) return
-        _updateCheckVisible.value = true
-        apkDownloadJob = viewModelScope.launch {
-            _updateCheckState.value = UpdateCheckUiState.Downloading(
-                latestTag = target.latestTag,
-                percent = 0,
-                downloaded = 0,
-                total = asset.size
-            )
-            val result = apkDownloader.download(
-                url = asset.url,
-                mirror = updateCheckSettingsRepository.downloadMirror,
-                fileName = "aicode-${target.latestTag}.apk",
-                expectedSize = asset.size,
-                expectedSha256 = asset.sha256
-            ) { downloaded, total ->
-                _updateCheckState.value = UpdateCheckUiState.Downloading(
-                    latestTag = target.latestTag,
-                    percent = if (total > 0) ((downloaded * 100) / total).toInt().coerceIn(0, 100) else 0,
-                    downloaded = downloaded,
-                    total = total
-                )
-            }
-            when (result) {
-                is ApkDownloadResult.Success -> {
-                    val verify = apkVerifier.verify(result.file)
-                    if (verify is ApkVerifyResult.Ok) {
-                        val ready = UpdateCheckUiState.ReadyToInstall(
-                            previous = target,
-                            apk = result.file,
-                            needPermission = !ApkInstaller.canInstall(context)
-                        )
-                        _updateCheckState.value = ready
-                        // 已授权就直接拉起安装器；未授权则停在「就绪」态，授权后回来再点一次即可
-                        if (!ready.needPermission) startInstall(ready)
-                    } else {
-                        _updateCheckState.value = UpdateCheckUiState.DownloadFailed(
-                            previous = target,
-                            message = verifyFailureMessage(verify)
-                        )
-                    }
-                }
-                is ApkDownloadResult.Failure -> {
-                    _updateCheckState.value = UpdateCheckUiState.DownloadFailed(
-                        previous = target,
-                        message = result.message
-                    )
-                }
-            }
-        }
-    }
-
-    /**
-     * 拉起系统安装器。未授权「安装未知应用」时先引导去设置页，授权后回到 App 再点一次即装
-     * （安装包已落盘，不重下）。
-     */
-    private fun startInstall(ready: UpdateCheckUiState.ReadyToInstall) {
-        when (ApkInstaller.install(context, ready.apk)) {
-            ApkInstaller.Result.STARTED -> {
-                FileLogger.i("SettingsViewModel", "已拉起系统安装器：${ready.apk.name}")
-                _updateCheckVisible.value = false
-                _updateCheckState.value = UpdateCheckUiState.Idle
-            }
-            ApkInstaller.Result.NEED_PERMISSION -> {
-                _updateCheckState.value = ready.copy(needPermission = true)
-                _updateCheckVisible.value = true
-                if (!ApkInstaller.openInstallPermissionSettings(context)) {
-                    _updateCheckState.value = UpdateCheckUiState.DownloadFailed(
-                        previous = ready.previous,
-                        message = context.getString(R.string.about_update_install_failed)
-                    )
-                }
-            }
-            ApkInstaller.Result.NO_HANDLER -> {
-                _updateCheckState.value = UpdateCheckUiState.DownloadFailed(
-                    previous = ready.previous,
-                    message = context.getString(R.string.about_update_install_failed)
-                )
-            }
-        }
-    }
-
-    private fun verifyFailureMessage(result: ApkVerifyResult): String = when (result) {
-        is ApkVerifyResult.Ok -> ""
-        is ApkVerifyResult.NotAnApk -> context.getString(R.string.about_update_verify_not_apk)
-        is ApkVerifyResult.PackageMismatch -> context.getString(R.string.about_update_verify_package)
-        is ApkVerifyResult.SignatureMismatch -> context.getString(R.string.about_update_verify_signature)
-        is ApkVerifyResult.NotNewer -> context.getString(R.string.about_update_verify_not_newer)
-    }
-
-    /** 关闭更新弹窗：只收起界面，下载中的任务继续跑（状态保留，重开可见）。 */
-    fun dismissUpdateCheck() {
-        _updateCheckVisible.value = false
-    }
-
-    /** 自动检查更新开关（默认开启）。 */
-    fun setUpdateCheckEnabled(enabled: Boolean) {
-        updateCheckSettingsRepository.autoCheckEnabled = enabled
-        _updateCheckEnabled.value = enabled
-    }
-
-    /** 更新通道：稳定版 / 最新版。 */
-    fun setUpdateCheckChannel(channel: UpdateChannel) {
-        updateCheckSettingsRepository.channel = channel
-        _updateCheckChannel.value = channel
-    }
-
-    /** 更新包下载镜像源；留空表示直连 GitHub。 */
-    fun setUpdateCheckMirror(mirror: String) {
-        updateCheckSettingsRepository.downloadMirror = mirror
-        _updateCheckMirror.value = updateCheckSettingsRepository.downloadMirror
-    }
-
-    private fun currentVersionName(): String = runCatching {
-        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
-    }.getOrDefault("unknown")
 
     /**
      * 判断日志行是否属于某个 MCP server：只认 MCP 组件写下的日志（tag 以 `Mcp` 开头，

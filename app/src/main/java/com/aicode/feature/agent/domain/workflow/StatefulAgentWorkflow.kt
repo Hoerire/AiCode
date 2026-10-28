@@ -129,6 +129,10 @@ class StatefulAgentWorkflow @Inject constructor(
         const val LIVE_TAIL_CHARS = 4_000
         const val PROGRESS_INTERVAL_MS = 250L
         const val USER_REJECTED_CODE = "USER_REJECTED"
+        /** 派发闸门：本回合尚未派发子代理就动写操作时的拒绝码，与 PLAN/SYSTEM 拒绝区分。 */
+        const val DISPATCH_GATE_CODE = "DISPATCH_GATE"
+        /** 触发派发闸门的工具：会改文件或执行命令的。只读工具（readFile/search 等）不拦。 */
+        val DISPATCH_GATED_TOOLS = setOf("writeFile", "editFile", "Bash", "terminal")
         const val TITLE_GENERATOR_FILE = "agent/title-generator.md"
         const val TITLE_MAX_CHARS = 50
         const val COMMIT_GENERATOR_FILE = "agent/commit-generator.md"
@@ -163,7 +167,11 @@ class StatefulAgentWorkflow @Inject constructor(
         /** 已批准、待并行执行的 toolCall */
         val approvedToolCalls: List<ToolCall> = emptyList(),
         /** 被策略/系统拒绝（非用户拒绝）的 tool 结果，key = toolCall.id */
-        val rejectedToolResults: Map<String, ToolBatchResult> = emptyMap()
+        val rejectedToolResults: Map<String, ToolBatchResult> = emptyMap(),
+        /** 本回合是否已有 task 工具成功执行（回合级，状态随 executeEvents 重建）。 */
+        val subagentDispatched: Boolean = false,
+        /** 本回合派发闸门是否已拦过一次：拦过即放行，避免单步任务被反复卡住。 */
+        val dispatchGateTripped: Boolean = false
     )
 
     /** 改变状态的动作 (Action) */
@@ -441,6 +449,8 @@ class StatefulAgentWorkflow @Inject constructor(
                     val remaining = newState.pendingPermissionCalls.filterNot { it.id == action.toolCall.id }
                     newState = newState.copy(
                         pendingPermissionCalls = remaining,
+                        dispatchGateTripped = newState.dispatchGateTripped ||
+                            action.errorCode == DISPATCH_GATE_CODE,
                         rejectedToolResults = newState.rejectedToolResults + (
                             action.toolCall.id to ToolBatchResult(
                                 id = action.toolCall.id,
@@ -479,7 +489,9 @@ class StatefulAgentWorkflow @Inject constructor(
                     batchToolCalls = emptyList(),
                     pendingPermissionCalls = emptyList(),
                     approvedToolCalls = emptyList(),
-                    rejectedToolResults = emptyMap()
+                    rejectedToolResults = emptyMap(),
+                    subagentDispatched = state.subagentDispatched ||
+                        action.results.any { it.toolName == "task" && !it.isError }
                 )
                 effects.add(AgentSideEffect.CallLlm)
             }
@@ -741,7 +753,8 @@ class StatefulAgentWorkflow @Inject constructor(
                     is AgentSideEffect.RequestPermission -> {
                         val tool = toolRegistry.getTool(effect.toolCall.name)
                         val argsPreview = JsonObject(effect.toolCall.arguments).toString().take(500)
-                        val checkResult = requestPermissionIfNeeded(tool, effect.toolCall.id, effect.toolCall.arguments, argsPreview, currentContext.permissionMode, currentContext.sessionId)
+                        val checkResult = dispatchGate(state, effect.toolCall, currentContext.isSubagentSession)
+                            ?: requestPermissionIfNeeded(tool, effect.toolCall.id, effect.toolCall.arguments, argsPreview, currentContext.permissionMode, currentContext.sessionId)
 
                         if (!checkResult.approved) {
                             val rawResult = ToolResult.Error(checkResult.denyReason, checkResult.errorCode).toTransportString()
@@ -1364,6 +1377,31 @@ class StatefulAgentWorkflow @Inject constructor(
             this["files_attached"] = JsonPrimitive(true)
         }
         return ToolResult.Success(JsonObject(strippedData))
+    }
+
+    /**
+     * 派发闸门：每回合首次写操作时，若此前没有 task 成功派发，就先拒一次，逼模型判断任务能否拆分。
+     * 拦过一次即放行（[AgentSessionState.dispatchGateTripped]）；确为单步的任务用 `direct: true` 过闸。
+     */
+    private fun dispatchGate(
+        state: AgentSessionState,
+        call: ToolCall,
+        isSubagentSession: Boolean
+    ): PermissionCheckResult? {
+        // 子代理会话本来就已被主会话派发过，再拦它只会让每个子代理白付一次往返。
+        if (isSubagentSession) return null
+        if (state.subagentDispatched || state.dispatchGateTripped) return null
+        // 同批里已经带 task 调用则不算绕过：派发与写操作一起发出属于合法拆分。
+        if (state.batchToolCalls.any { it.name == "task" }) return null
+        if (call.name !in DISPATCH_GATED_TOOLS) return null
+        if ((call.arguments["direct"] as? JsonPrimitive)?.booleanOrNull == true) return null
+        return PermissionCheckResult(
+            approved = false,
+            denyReason = "本轮尚未派发子代理，已拦截一次 ${call.name}。" +
+                "若任务涉及多个文件、多步骤或需要先探索，请先调用 task(action=\"create\") 派发子代理；" +
+                "确认为单步操作，请在参数中加 \"direct\": true 重试。",
+            errorCode = DISPATCH_GATE_CODE
+        )
     }
 
     private suspend fun requestPermissionIfNeeded(

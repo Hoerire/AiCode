@@ -2,6 +2,7 @@ package com.aicode.feature.agent.domain.tool.file
 
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.tool.AgentTool
+import com.aicode.feature.agent.domain.tool.DirectExecutionParameter
 import com.aicode.feature.agent.domain.tool.FileVersionRegistry
 import com.aicode.feature.agent.domain.tool.ParameterType
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
@@ -185,7 +186,8 @@ class WriteFileTool @Inject constructor(
     override val parameters = mapOf(
         "path" to ToolParameter("path", ParameterType.STRING, "文件路径：~/workspace/... 为项目文件；其它绝对路径（如 /etc/...、/root/...）为容器系统文件。", required = true),
         "content" to ToolParameter("content", ParameterType.STRING, "文件内容", required = true),
-        "overwrite" to ToolParameter("overwrite", ParameterType.BOOLEAN, "目标已存在时是否覆盖。默认 true；设为 false 时若文件已存在则报错。", required = false)
+        "overwrite" to ToolParameter("overwrite", ParameterType.BOOLEAN, "目标已存在时是否覆盖。默认 true；设为 false 时若文件已存在则报错。", required = false),
+        "direct" to DirectExecutionParameter
     )
 
     override fun buildPermissionRequest(

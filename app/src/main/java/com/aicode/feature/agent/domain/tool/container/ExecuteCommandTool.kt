@@ -5,6 +5,7 @@ import com.aicode.feature.agent.domain.container.CommandEngine
 import com.aicode.feature.agent.domain.container.CommandEvent
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.tool.AgentTool
+import com.aicode.feature.agent.domain.tool.DirectExecutionParameter
 import com.aicode.feature.agent.domain.tool.ParameterType
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
 import com.aicode.feature.agent.domain.tool.StreamingAgentTool
@@ -48,7 +49,10 @@ class ExecuteCommandTool @Inject constructor(
     }
 
     override val name = "Bash"
-    override val description = "在当前执行环境（本地容器或远程 SSH）中执行短时、一次性的 Shell 命令，等待命令结束后返回输出，适合状态查询、快速检查等临时操作。耗时任务、常驻服务或需要持续交互的命令用 terminal；不要用 & 在本工具中挂后台。"
+    override val description = "在当前执行环境（本地容器或远程 SSH）中执行短时、一次性的 Shell 命令，等待命令结束后返回输出，适合状态查询、快速检查等临时操作。耗时任务、常驻服务或需要持续交互的命令用 terminal；不要用 & 在本工具中挂后台。" +
+        "\n\n宿主机 root：命令以 `root ` 或 `sudo ` 开头时（例：`root id`、`root ls /data/data`），" +
+        "该命令会脱离容器、直接以宿主 uid=0 执行（工作目录仍为当前工作区物理路径），可访问 /data、/system 等容器内不可见路径；" +
+        "未加前缀的命令一律在未提权的容器内执行。仅在确实需要系统级权限时使用前缀（如读写其他应用数据、修改系统属性、起 tcpdump/frida-server）。"
     override val permissionPolicy = ToolPermissionPolicy.ASK
     override val capabilities = setOf(ToolCapability.EXECUTE_COMMANDS)
 
@@ -70,7 +74,8 @@ class ExecuteCommandTool @Inject constructor(
             type = ParameterType.BOOLEAN,
             description = "命令被安全防护拒绝且确需执行时，设为 true 重试，通过弹窗申请用户单次授权，不保存为长期规则。PLAN 模式不支持。",
             required = false
-        )
+        ),
+        "direct" to DirectExecutionParameter
     )
 
     /** 解析 timeout（秒）参数并钳到合法范围，返回毫秒；缺省用默认值。 */

@@ -93,14 +93,10 @@ data class AgentDefinition(
         disallowedTools.any { matches(it, toolName) }
 
     /**
-     * 该定义派出的子代理实际生效的运行模式（与 SessionUseCase.resolveChildMode 同规则）：
-     * 默认继承父会话；定义自带 [mode] 时只能往更严的方向收、不能放大。
-     * 返回 null 表示两边都没给出（极罕见的无模式上下文）。
+     * 该定义派出的子代理实际生效的运行模式：与父会话完全一致，定义无法覆盖。
+     * 返回 null 表示父会话没有给出模式（极罕见的无模式上下文）。
      */
-    fun effectiveMode(parentMode: AgentMode?): AgentMode? = when {
-        mode != null && parentMode != null -> mode.limitedBy(parentMode)
-        else -> mode ?: parentMode
-    }
+    fun effectiveMode(parentMode: AgentMode?): AgentMode? = parentMode
 
     /**
      * 派发前给主代理看的能力摘要（读 / 写 / 命令三个维度）。

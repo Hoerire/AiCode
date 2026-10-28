@@ -125,7 +125,7 @@ class SessionUseCase @Inject constructor(
      * @param providerId 覆盖 provider；null 表示继承父会话
      * @param model 覆盖模型；null 表示继承父会话
      * @param reasoningEffort 覆盖思考强度；null 表示继承父会话
-     * @param mode 覆盖运行模式；null 表示继承父会话（只能往更严的方向收，不能放大，见 [resolveChildMode]）
+     * 运行模式一律跟随父会话，不接受定义覆盖。
      */
     fun newSubSessionEntity(
         title: String,
@@ -134,8 +134,7 @@ class SessionUseCase @Inject constructor(
         subagentType: String,
         providerId: String? = null,
         model: String? = null,
-        reasoningEffort: String? = null,
-        mode: AgentMode? = null
+        reasoningEffort: String? = null
     ): ChatSessionEntity {
         val now = System.currentTimeMillis()
         return ChatSessionEntity(
@@ -146,7 +145,7 @@ class SessionUseCase @Inject constructor(
             updatedAt = now,
             // 默认继承父会话 mode：权限引擎按会话 mode 判定写拦截，默认 BUILD 会让 PLAN
             // 模式下派出的子代理绕过只读限制，反过来 AUTO 模式的子代理又会弹授权窗打扰用户。
-            mode = resolveChildMode(mode, parent.mode),
+            mode = effectiveParentMode(parent),
             providerId = providerId ?: parent.providerId,
             model = model ?: parent.model,
             reasoningEffort = reasoningEffort ?: parent.reasoningEffort,
@@ -156,15 +155,24 @@ class SessionUseCase @Inject constructor(
     }
 
     /**
-     * 子会话实际生效的模式：默认继承父会话；自定义子代理的定义可覆盖，但只能更严、不能更宽。
+     * 父会话的实际权限模式。
      *
-     * 若允许放大，PLAN 下派一个 `mode: build` 的子代理就能直接改文件——这正是业界把
-     * 「子代理不继承父权限」列为安全漏洞的原因。父会话 mode 值异常时按继承处理。
+     * goal 自主循环期间会话按 AUTO 运行（工具自动放行、PLAN 停用），但持久化的 [ChatSessionEntity.mode]
+     * 可能仍是 BUILD——`setGoalText` 只在 PLAN 时改写 mode。若直接沿用 parent.mode，派出的子代理
+     * 会被降到 BUILD，后台执行写操作时反复请求授权、看不到弹窗就表现为不可写。
+     * 故此处把 goal 活跃视为 AUTO，与主会话自身的运行语义保持一致。
      */
-    internal fun resolveChildMode(requested: AgentMode?, parentMode: String): String {
-        val parent = runCatching { AgentMode.valueOf(parentMode) }.getOrNull() ?: return parentMode
-        return (requested ?: parent).limitedBy(parent).name
-    }
+    private fun effectiveParentMode(parent: ChatSessionEntity): String =
+        if (parent.goalStatus == GoalStatus.ACTIVE.name) AgentMode.AUTO.name else parent.mode
+
+    /**
+     * 子会话实际生效的模式：完全等于父会话的有效模式，定义无法覆盖。
+     *
+     * 子代理是父会话的延伸，用户已经用父会话的模式表达了对当前任务的授权级别；
+     * 若再让定义收窄，子代理会跑在比父会话更严的边界里，后台执行时会卡在授权确认上，
+     * 表现为「不可读不可写」。父会话 mode 值异常时直接原样继承，由权限引擎兜底。
+     */
+    internal fun resolveChildMode(parentMode: String): String = parentMode
 
     suspend fun upsertSession(entity: ChatSessionEntity) {
         chatSessionDao.upsert(entity)

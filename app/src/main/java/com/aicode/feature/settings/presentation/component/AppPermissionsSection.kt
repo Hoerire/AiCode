@@ -25,6 +25,7 @@ import com.aicode.core.ui.AppSwitch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,7 +35,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.aicode.R
+import com.aicode.core.root.HostRoot
+import com.aicode.core.root.RootModeStore
 import com.aicode.core.theme.Spacing
 import com.aicode.feature.agent.domain.shizuku.ShizukuState
 import compose.icons.FeatherIcons
@@ -179,6 +184,45 @@ internal fun AppPermissionsSection(
                         text = stringResource(shizukuState.statusRes()),
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            )
+            SettingsDivider()
+            // 真实 root 模式：开启后容器由 `su -c` 拉升的 proot 启动，容器内所有进程（终端 PTY、
+            // AI 的 Bash、git）都是宿主 uid=0（详见 RootModeStore 注释）。切换在下次启动容器时生效。
+            var rootMode by remember { mutableStateOf(RootModeStore.isEnabled(context)) }
+            var rootDetail by remember { mutableStateOf("") }
+            var rootProbing by remember { mutableStateOf(false) }
+            LaunchedEffect(rootMode) {
+                if (!rootMode) {
+                    rootDetail = ""
+                    return@LaunchedEffect
+                }
+                rootProbing = true
+                // probe 会触发 Magisk 授权弹窗，最长等 15s，必须离开主线程
+                rootDetail = withContext(Dispatchers.IO) { HostRoot().probe(force = true).detail }
+                rootProbing = false
+            }
+            SettingsRow(
+                icon = FeatherIcons.Shield,
+                title = stringResource(R.string.settings_root_mode),
+                subtitle = when {
+                    !rootMode -> stringResource(R.string.settings_root_mode_desc)
+                    rootProbing -> stringResource(R.string.settings_root_mode_probing)
+                    else -> rootDetail
+                },
+                onClick = {
+                    val next = !rootMode
+                    RootModeStore.setEnabled(context, next)
+                    rootMode = next
+                },
+                trailing = {
+                    AppSwitch(
+                        checked = rootMode,
+                        onCheckedChange = { next ->
+                            RootModeStore.setEnabled(context, next)
+                            rootMode = next
+                        }
                     )
                 }
             )

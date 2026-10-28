@@ -2,6 +2,7 @@ package com.aicode.feature.agent.domain.tool.container
 
 import com.aicode.core.util.FileLogger
 import com.aicode.feature.agent.domain.tool.AgentTool
+import com.aicode.feature.agent.domain.tool.DirectExecutionParameter
 import com.aicode.feature.agent.domain.tool.ParameterType
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
 import com.aicode.feature.agent.domain.tool.StreamingAgentTool
@@ -181,7 +182,8 @@ class TerminalSessionTool @Inject constructor(
             type = ParameterType.BOOLEAN,
             description = "start/send 的命令被安全防护拒绝且确需执行时，设为 true 重试，通过弹窗申请用户单次授权，不保存为长期规则。PLAN 模式不支持。",
             required = false
-        )
+        ),
+        "direct" to DirectExecutionParameter
     )
 
     private fun actionOf(args: Map<String, JsonElement>): String =

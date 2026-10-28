@@ -35,6 +35,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -77,7 +78,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aicode.R
+import com.aicode.core.theme.Radius
 import com.aicode.core.theme.Spacing
+import com.aicode.core.ui.ChevronRotationStyle
+import com.aicode.core.ui.ExpandableChevronIcon
 import com.aicode.core.ui.ImageViewerHost
 import com.aicode.core.ui.LocalImageViewer
 import com.aicode.core.ui.readableContentMaxWidth
@@ -96,12 +100,15 @@ import com.aicode.feature.settings.presentation.SettingsViewModel
 import com.aicode.feature.settings.domain.model.DashboardContext
 import com.aicode.feature.settings.domain.model.ProviderDashboardState
 import com.aicode.feature.settings.domain.model.modelMetadataKey
+import com.aicode.feature.terminal.domain.recentOutputLines
 import com.aicode.feature.workspace.domain.WorkspacePathMapper
 import com.aicode.feature.workspace.presentation.WorkspaceViewModel
 import compose.icons.FeatherIcons
 import compose.icons.feathericons.ArrowDown
 import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
@@ -1777,6 +1784,112 @@ fun AIChatPanel(
                 }
             }
 
+            // 后台终端任务（构建、下载、长驻服务）运行中：AI 回合结束不代表没事干，
+            // 不显示这层状态的话界面看起来完全空闲，用户不知道后台还有进程在跑。
+            val backgroundTasks by viewModel.runningBackgroundTasks.collectAsStateWithLifecycle()
+            // 每秒推一次重组，让提示条上的已运行时长持续走动。
+            var nowMillis by remember { mutableStateOf(System.currentTimeMillis()) }
+            // 后台任务最近输出的原始行：直接转发终端屏幕内容，让用户看到「还在跑」，不靠模型转述。
+            var recentOutput by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+            LaunchedEffect(backgroundTasks.isNotEmpty()) {
+                while (backgroundTasks.isNotEmpty()) {
+                    nowMillis = System.currentTimeMillis()
+                    recentOutput = withContext(Dispatchers.Default) {
+                        backgroundTasks.associate { it.id to it.recentOutputLines(2) }
+                    }
+                    delay(1000)
+                }
+            }
+            // 退场动画期间 backgroundTasks 已清空，但 AnimatedVisibility 仍会渲染 content，
+            // 此时取 first() 会抛 NoSuchElementException 直接打死 App，故用非空记忆值兜住。
+            val shownTasks = rememberLastNonNull(backgroundTasks.takeIf { it.isNotEmpty() })
+            // 折叠态只报数量与计时，展开才列具体命令：单行命令过长必然截断，列表更适合看细节。
+            var tasksExpanded by remember { mutableStateOf(false) }
+            LaunchedEffect(backgroundTasks.isEmpty()) {
+                if (backgroundTasks.isEmpty()) tasksExpanded = false
+            }
+            AnimatedVisibility(
+                visible = backgroundTasks.isNotEmpty(),
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                shownTasks?.let { tasks ->
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(Radius.lg),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            // 与 ChatInputBar 根 Column 的 padding(horizontal = Spacing.lg) 对齐，
+                            // 否则提示条会比输入框宽出一截。
+                            .padding(horizontal = Spacing.lg, vertical = Spacing.xs)
+                            .clickable { tasksExpanded = !tasksExpanded }
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                            androidx.compose.foundation.layout.Row(
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                androidx.compose.material3.Text(
+                                    text = "后台任务 ${tasks.size} 个运行中 · " +
+                                        formatElapsed((nowMillis - tasks.first().startedAt).coerceAtLeast(0L)),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                ExpandableChevronIcon(
+                                    expanded = tasksExpanded,
+                                    style = ChevronRotationStyle.RIGHT_DOWN,
+                                    size = 14.dp,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            // 折叠态也留一行最新输出：只看一行就能确认任务仍在推进。
+                            if (!tasksExpanded) {
+                                val latest = tasks.firstNotNullOfOrNull { tab ->
+                                    recentOutput[tab.id]?.takeIf { it.isNotBlank() }
+                                        ?.substringAfterLast('\n')
+                                }
+                                if (latest != null) {
+                                    androidx.compose.material3.Text(
+                                        text = latest.take(200),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                        modifier = Modifier.padding(top = 2.dp)
+                                    )
+                                }
+                            }
+                            AnimatedVisibility(visible = tasksExpanded) {
+                                Column {
+                                    tasks.forEach { tab ->
+                                        androidx.compose.material3.Text(
+                                            text = "· " + (tab.command?.lineSequence()?.joinToString(" ")?.take(300)
+                                                ?: tab.title),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.padding(top = 4.dp)
+                                        )
+                                        recentOutput[tab.id]?.takeIf { it.isNotBlank() }?.let { tail ->
+                                            androidx.compose.material3.Text(
+                                                text = tail.lines().takeLast(2).joinToString("\n")
+                                                    .take(240),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                                                maxLines = 2,
+                                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                                modifier = Modifier.padding(start = 8.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             ChatInputBar(
                 value = inputText,
                 onValueChange = viewModel::updateInputDraft,
@@ -2059,3 +2172,35 @@ private fun ScrollToBottomButton(
     }
 }
 
+/** 后台任务提示条的文案：单条显示命令与已运行时长，多条只报数量与最长时长。 */
+private fun backgroundTaskLabel(
+    tasks: List<com.aicode.feature.terminal.domain.TerminalTab>,
+    elapsedMs: Long
+): String {
+    val elapsed = formatElapsed(elapsedMs)
+    return if (tasks.size == 1) {
+        val single = tasks.first()
+        val cmd = single.command?.lineSequence()?.firstOrNull()?.take(60)?.takeIf { it.isNotBlank() }
+            ?: single.title
+        "后台任务运行中：$cmd · $elapsed"
+    } else {
+        "后台任务 ${tasks.size} 个运行中 · $elapsed"
+    }
+}
+
+/** 运行时长：不足 1 分钟显示秒，其余显示 分:秒。 */
+private fun formatElapsed(ms: Long): String {
+    val totalSeconds = ms / 1000
+    return if (totalSeconds < 60) {
+        "${totalSeconds}s"
+    } else {
+        val minutes = totalSeconds / 60
+        val seconds = totalSeconds % 60
+        if (minutes >= 60) {
+            val hours = minutes / 60
+            "${hours}h ${minutes % 60}m"
+        } else {
+            "${minutes}m ${seconds}s"
+        }
+    }
+}

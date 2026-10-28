@@ -2,6 +2,7 @@ package com.aicode.feature.agent.domain.tool.editor
 
 import com.aicode.feature.agent.domain.model.AgentContext
 import com.aicode.feature.agent.domain.tool.AgentTool
+import com.aicode.feature.agent.domain.tool.DirectExecutionParameter
 import com.aicode.feature.agent.domain.tool.FileVersionRegistry
 import com.aicode.feature.agent.domain.tool.ParameterType
 import com.aicode.feature.agent.domain.tool.PendingToolPermission
@@ -96,7 +97,8 @@ class EditFileTool @Inject constructor(
                 "单处修改也用只含一个元素的数组。每个元素：{old_string, new_string, replace_all?}。",
             required = true,
             itemsSchema = editItemSchema
-        )
+        ),
+        "direct" to DirectExecutionParameter
     )
 
     /** 解析后的单个编辑。 */

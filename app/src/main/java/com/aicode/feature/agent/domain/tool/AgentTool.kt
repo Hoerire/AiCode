@@ -49,6 +49,17 @@ data class ToolParameter(
     val itemsSchema: Map<String, Any>? = null
 )
 
+/**
+ * 派发闸门逃生参数：声明本次调用确为单步操作，跳过「先派发子代理」的拦截。
+ * 只由 StatefulAgentWorkflow.dispatchGate 读取，各工具实现不消费该字段。
+ */
+val DirectExecutionParameter = ToolParameter(
+    name = "direct",
+    type = ParameterType.BOOLEAN,
+    description = "本调用确为单步操作、无需派发子代理时设 true，跳过派发闸门的拦截。默认 false。",
+    required = false
+)
+
 enum class ParameterType {
     STRING, INTEGER, BOOLEAN, ARRAY, OBJECT
 }

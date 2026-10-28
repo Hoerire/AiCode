@@ -264,9 +264,6 @@ fun SettingsScreen(
     val containerOsMap by viewModel.containerOsMap.collectAsStateWithLifecycle()
     val remoteConnections by viewModel.remoteConnections.collectAsStateWithLifecycle()
     val tokenStats by viewModel.tokenStats.collectAsStateWithLifecycle()
-    val updateCheckEnabled by viewModel.updateCheckEnabled.collectAsStateWithLifecycle()
-    val updateCheckChannel by viewModel.updateCheckChannel.collectAsStateWithLifecycle()
-    val updateCheckMirror by viewModel.updateCheckMirror.collectAsStateWithLifecycle()
     val containerAnnouncementText by viewModel.containerAnnouncementText.collectAsStateWithLifecycle()
     val containerAnnouncementOutdated by viewModel.containerAnnouncementOutdated.collectAsStateWithLifecycle()
     val promptsAnnouncementText by viewModel.promptsAnnouncementText.collectAsStateWithLifecycle()
@@ -1209,15 +1206,7 @@ fun SettingsScreen(
                 SettingsSection.SubAgentEditor -> {} // 已在上方 early return 处理
                 SettingsSection.RemoteServers -> {} // 已在上方 early return 处理
                 SettingsSection.Backup -> {} // 已在上方 early return 处理
-                SettingsSection.About -> AboutSection(
-                    updateCheckEnabled = updateCheckEnabled,
-                    updateCheckChannel = updateCheckChannel,
-                    updateCheckMirror = updateCheckMirror,
-                    onToggleUpdateCheck = { viewModel.setUpdateCheckEnabled(it) },
-                    onSelectChannel = { viewModel.setUpdateCheckChannel(it) },
-                    onSelectMirror = { viewModel.setUpdateCheckMirror(it) },
-                    onCheckUpdate = { viewModel.checkUpdate(manual = true) }
-                )
+                SettingsSection.About -> AboutSection()
             }
         }
     }

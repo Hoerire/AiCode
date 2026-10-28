@@ -51,7 +51,9 @@ class TerminalTab(
     /** 发起该后台命令的会话 id；交互标签为 null。回调据此路由回原会话。 */
     val sourceSessionId: String? = null,
     val client: com.termux.terminal.TerminalSessionClient? = null,
-    runState: RunState
+    runState: RunState,
+    /** 标签创建时间，供「后台任务运行中」提示条显示已运行时长。 */
+    val startedAt: Long = System.currentTimeMillis()
 ) {
     var title: String = title
         internal set
@@ -68,6 +70,18 @@ class TerminalTab(
      */
     @Volatile
     var finishedNotified: Boolean = false
+}
+
+/**
+ * 取光标附近最近 [count] 行屏幕文本，供 UI 显示「仍在输出」的证据。
+ * 只读指定行区间，不构建整份 transcript——后者在长构建下每秒重建会明显拖慢主线程。
+ */
+fun TerminalTab.recentOutputLines(count: Int = 2): String {
+    val emulator = session.emulator ?: return ""
+    val bottom = emulator.cursorRow.coerceAtLeast(0)
+    val top = (bottom - count + 1).coerceAtLeast(0)
+    // 末参 x2 传大值，getSelectedText 内部会钳到实际列数。
+    return emulator.screen?.getSelectedText(0, top, 10_000, bottom)?.trim().orEmpty()
 }
 
 /**

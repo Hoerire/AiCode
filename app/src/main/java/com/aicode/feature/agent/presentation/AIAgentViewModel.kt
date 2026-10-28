@@ -66,7 +66,9 @@ import com.aicode.feature.agent.domain.subagent.SubAgentDigester
 import com.aicode.feature.agent.domain.subagent.SubAgentDigest
 import com.aicode.feature.agent.domain.subagent.SubAgentEventType
 import com.aicode.feature.agent.domain.workflow.AgentWorkflow
+import com.aicode.feature.terminal.domain.RunState
 import com.aicode.feature.terminal.domain.TabFinishedEvent
+import com.aicode.feature.terminal.domain.TerminalTab
 import com.aicode.feature.terminal.domain.TerminalKeepaliveService
 import com.aicode.feature.terminal.domain.TerminalSessionManager
 import com.aicode.feature.terminal.domain.TerminalSessionProvider
@@ -823,8 +825,8 @@ class AIAgentViewModel @Inject constructor(
         }
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    val currentSessionMode: StateFlow<AgentMode> = currentSessionState.map { it?.mode ?: AgentMode.BUILD }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, AgentMode.BUILD)
+    val currentSessionMode: StateFlow<AgentMode> = currentSessionState.map { it?.mode ?: AgentMode.AUTO }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, AgentMode.AUTO)
 
     /** 当前会话的持续目标（goal）快照；null 表示未设定目标。 */
     val currentSessionGoal: StateFlow<SessionGoalUi?> = currentSessionState
@@ -1086,10 +1088,26 @@ class AIAgentViewModel @Inject constructor(
         if (sessions.value.any { sessionJobs[it.id]?.isActive == true }) return true
         // 子代理会话不在 sessions（只含根会话）里：漏掉它们会在父代理这一轮结束时
         // 提前释放唤醒锁与前台服务，仍在跑的子代理会被系统挂起。
-        return subSessionsByParent.value.values.any { subs ->
-            subs.any { sessionJobs[it.id]?.isActive == true }
+        if (subSessionsByParent.value.values.any { subs -> subs.any { sessionJobs[it.id]?.isActive == true } }) {
+            return true
         }
+        // 后台终端任务（构建、下载、长驻服务）也是「还在干活」：不纳入会让 app 提前释放唤醒锁，
+        // 熄屏后进程被挂起，任务跟着变慢甚至被杀。
+        return terminalSessionManager.hasBackgroundTabs()
     }
+
+    /**
+     * 运行中的后台终端任务，供会话界面展示。
+     *
+     * AI 回合结束后 [AgentUIState] 回到 Idle，但后台任务仍在跑；不单独暴露这层状态，
+     * 界面就显示成完全空闲，用户看不到后台还有东西在运行。
+     */
+    val runningBackgroundTasks: StateFlow<List<TerminalTab>> =
+        // runState 是普通 var，改它不会让 tabs 这个 StateFlow 重新发射；必须并上 revision，
+        // 否则后台命令结束时提示条不会消失（界面一直显示「运行中」）。
+        combine(terminalSessionManager.tabs, terminalSessionManager.revision) { tabs, _ ->
+            tabs.filter { it.isBackground && it.runState is RunState.Running }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /** 任务开始：拿 CPU 唤醒锁并拉起前台保活通知，避免熄屏或切后台时进程被挂起、回收。 */
     private fun acquireKeepalive() {
@@ -1496,6 +1514,11 @@ class AIAgentViewModel @Inject constructor(
                 resultExcerpt = digest?.excerpt,
                 changedFiles = digest?.changedFiles.orEmpty()
             )
+            // 子代理任务结束后即清理会话：结果已随卡片与通知交付，留着只会让侧边栏堆满已完成条目。
+            // 先发通知再删库，保证父会话能拿到摘要；删除失败只记日志，不影响主流程。
+            runCatching { sessionUseCase.deleteSession(event.subSessionId) }
+                .onFailure { FileLogger.w(TAG, "子代理会话清理失败: ${event.subSessionId}", it) }
+            clearSessionRuntimeState(event.subSessionId)
         }
     }
 
@@ -1892,7 +1915,7 @@ class AIAgentViewModel @Inject constructor(
 
             val sessionEntity = sessionUseCase.getSessionById(sessionId)
             val sessionDomain = sessionEntity?.toDomain()
-            val mode = sessionDomain?.mode ?: AgentMode.BUILD
+            val mode = sessionDomain?.mode ?: AgentMode.AUTO
             // 子会话的 subagentType 存的是自定义 agent 名；能查到定义时提示词与工具集都按它组装。
             // 定义来自目录扫描（远程模式经 SFTP），故切到 IO，避免阻塞主线程。
             val agentDefinition = withContext(Dispatchers.IO) {
@@ -1916,7 +1939,8 @@ class AIAgentViewModel @Inject constructor(
                 goal = sessionDomain?.goal,
                 goalStatus = sessionDomain?.goalStatus,
                 reasoningEffort = sessionDomain?.reasoningEffort?.apiValue,
-                agentDefinition = agentDefinition
+                agentDefinition = agentDefinition,
+                isSubagentSession = isSubSession
             )
 
             val allTools = toolRegistry.getAvailableTools()
@@ -2678,7 +2702,7 @@ class AIAgentViewModel @Inject constructor(
         sessionUseCase.setGoal(sid, goalText, session.totalInputTokens, session.totalOutputTokens)
         // goal 与 PLAN 互斥：自主循环期间 PLAN 退出门禁需人工审查，故设定 goal 时若处于 PLAN 则强制退出。
         if (runCatching { AgentMode.valueOf(session.mode) }.getOrNull() == AgentMode.PLAN) {
-            sessionUseCase.updateMode(sid, AgentMode.BUILD.name)
+            sessionUseCase.updateMode(sid, AgentMode.AUTO.name)
         }
         persistGoalNotice(
             sid,

@@ -205,7 +205,10 @@ class TerminalSessionManager @Inject constructor(
         // 后台命令不抢占当前标签焦点：仅当没有活动标签时才设为当前。
         if (_activeTabId.value == null) _activeTabId.value = id
 
-        if (notify) monitorBackgroundExit(id)
+        // 结束监控必须对所有后台标签启动：notify 只决定是否给 AI 发完成通知，
+        // 而 runState 的收尾影响的是「后台任务运行中」这类 UI 状态。少了它，
+        // 未开 notify 的后台命令会永远停在 Running，提示条一直不消失。
+        monitorBackgroundExit(id)
 
         startKeepaliveService()
         FileLogger.i(TAG, "后台命令标签 $id: $command")

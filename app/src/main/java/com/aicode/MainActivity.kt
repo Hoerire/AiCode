@@ -103,10 +103,7 @@ import com.aicode.feature.settings.data.repository.ScreenOnSettingsRepository
 import com.aicode.feature.settings.data.repository.ThemeSettingsRepository
 import com.aicode.feature.settings.presentation.SettingsViewModel
 import com.aicode.feature.settings.presentation.FetchState
-import com.aicode.feature.settings.presentation.UpdateCheckUiState
-import com.aicode.feature.settings.presentation.component.githubReleaseUrl
 import com.aicode.feature.settings.presentation.component.SettingsScreen
-import com.aicode.feature.settings.presentation.component.UpdateCheckDialog
 import com.aicode.feature.settings.presentation.component.decodeBackgroundBitmap
 import com.aicode.feature.settings.presentation.component.openUrl
 import com.aicode.feature.settings.presentation.component.settingsPageBackground
@@ -393,11 +390,6 @@ fun AppNavigation(
         if (!agreementAccepted) return@LaunchedEffect
         val status = onboardingRepository.status()
         onboardingCoordinator.initialize(status ?: OnboardingStatus.IN_PROGRESS)
-    }
-
-    // 自动检查更新：进入主页时异步检测（开关开启且每天最多一次，失败静默）
-    LaunchedEffect(agreementAccepted) {
-        if (agreementAccepted) settingsViewModel.checkUpdate(manual = false)
     }
 
     // 侧边栏打开时，系统返回键先收起侧边栏。
@@ -905,28 +897,6 @@ fun AppNavigation(
         ) {
             navBody()
         }
-    }
-
-    // 检查更新弹窗（全局宿主：自动检测与关于页手动检查共用，覆盖所有页面）
-    val updateCheckState by settingsViewModel.updateCheckState.collectAsStateWithLifecycle()
-    val updateCheckVisible by settingsViewModel.updateCheckVisible.collectAsStateWithLifecycle()
-    if (agreementAccepted && updateCheckVisible && updateCheckState != UpdateCheckUiState.Idle) {
-        val version = remember {
-            runCatching {
-                context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
-            }.getOrDefault("unknown")
-        }
-        UpdateCheckDialog(
-            state = updateCheckState,
-            currentVersion = version,
-            canInstallInApp = settingsViewModel.inAppInstallSupported,
-            onDismiss = { settingsViewModel.dismissUpdateCheck() },
-            onOpenRelease = { tag ->
-                openUrl(context, githubReleaseUrl(tag))
-                settingsViewModel.dismissUpdateCheck()
-            },
-            onDownload = { settingsViewModel.downloadAndInstall() }
-        )
     }
 
     // 首次启动引导覆层（覆盖所有路由之上，全程常驻顶层，页面切换平滑过渡绝不闪烁）。

@@ -85,7 +85,9 @@ data class AgentContext(
      * 本会话绑定的自定义子代理定义；非空表示这是一个按定义运行的子代理会话，
      * 系统提示词与工具集都按其配置组装（见 [com.aicode.feature.agent.domain.prompt.SystemPromptProvider]）。
      */
-    val agentDefinition: AgentDefinition? = null
+    val agentDefinition: AgentDefinition? = null,
+    /** 是否子代理会话（会话行 parentId 非空）：子代理本就由主会话派发而来，派发闸门不再对它设限。 */
+    val isSubagentSession: Boolean = false
 ) {
     /**
      * 工具授权判定用的有效模式：goal 自主循环激活期间按 AUTO 放行（保留灾难性安全防护），
